@@ -13,13 +13,14 @@
 		"enabled": true
 	},
 	/**
-	 * KV Namespace Bindings
-	 * Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#kv-namespaces
+	 * D1 Database Bindings
+	 * Docs: https://developers.cloudflare.com/d1/configuration/
 	 */
-	"kv_namespaces": [
+	"d1_databases": [
 		{
-			"binding": "USER_SESSIONS",
-			"id": "61e5129111ef46c89b3975e3756cda7d"
+			"binding": "DB",
+			"database_name": "my-app-db",
+			"database_id": "5703fb3d-df40-4206-9c58-05df95481cd3"
 		}
 	],
 	/**

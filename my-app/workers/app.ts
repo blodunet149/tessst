@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { createRequestHandler } from "react-router";
 
 interface Env {
-	USER_SESSIONS: KVNamespace;
+	DB: D1Database;
 	// Add other environment bindings as needed
 }
 
@@ -18,39 +18,27 @@ app.post("/api/auth/register", async (c) => {
       return c.json({ error: "All fields are required" }, 400);
     }
 
-    // In a real app, you'd hash the password with bcrypt or similar
-    // For this demo, we'll store plain text (don't do this in production!)
-    const user = {
-      id: Date.now().toString(), // Simple ID generation for demo
-      email,
-      password, // Should be hashed in production
-      firstName,
-      lastName,
-      createdAt: new Date().toISOString()
-    };
-
-    // In a real app, you'd save to a database like D1 or use KV
-    // For this demo, we'll just return the user
-    // In production, save to D1, KV, or another persistent storage
-
-    // Check if user already exists in KV
-    const existingUserKey = `user:${email}`;
-    const existingUser = await c.env.USER_SESSIONS.get(existingUserKey);
-
+    // Check if user already exists in database
+    const existingUser = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
     if (existingUser) {
       return c.json({ error: "User already exists" }, 409);
     }
 
-    // Store user in KV
-    await c.env.USER_SESSIONS.put(existingUserKey, JSON.stringify(user));
-    await c.env.USER_SESSIONS.put(`user_id:${user.id}`, email); // Index by ID
+    // In a real app, you'd hash the password with bcrypt or similar
+    // For this demo, we'll store plain text (don't do this in production!)
+    const userId = Date.now().toString(); // Simple ID generation for demo
+
+    // Insert new user into database
+    await c.env.DB.prepare(
+      'INSERT INTO users (id, email, password, firstName, lastName, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(userId, email, password, firstName, lastName, new Date().toISOString()).run();
 
     // For demo purposes, return success
     console.log(`New user registered: ${email}`);
 
     return c.json({
       message: "User registered successfully",
-      user: { id: user.id, email: user.email, firstName: user.firstName, lastName: user.lastName }
+      user: { id: userId, email: email, firstName: firstName, lastName: lastName }
     });
   } catch (error) {
     console.error("Registration error:", error);
@@ -66,15 +54,14 @@ app.post("/api/auth/login", async (c) => {
       return c.json({ error: "Email and password are required" }, 400);
     }
 
-    // Get user from KV
-    const userKey = `user:${email}`;
-    const userStr = await c.env.USER_SESSIONS.get(userKey);
+    // Get user from database
+    const user = await c.env.DB.prepare(
+      'SELECT id, email, password, firstName, lastName, createdAt FROM users WHERE email = ?'
+    ).bind(email).first();
 
-    if (!userStr) {
+    if (!user) {
       return c.json({ error: "Invalid email or password" }, 401);
     }
-
-    const user = JSON.parse(userStr);
 
     // In a real app, you'd compare hashed passwords here
     // For demo, we'll just check if the password matches exactly
@@ -85,8 +72,14 @@ app.post("/api/auth/login", async (c) => {
     // Generate a session token
     const sessionToken = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    // Store session in KV with expiration (24 hours)
-    await c.env.USER_SESSIONS.put(`session:${sessionToken}`, user.id, { expirationTtl: 86400 });
+    // Calculate expiration time (24 hours from now)
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours
+
+    // Store session in database
+    await c.env.DB.prepare(
+      'INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)'
+    ).bind(sessionToken, user.id, expiresAt.toISOString()).run();
 
     // Set a cookie with the session token
     c.header("Set-Cookie", `session_token=${sessionToken}; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict`); // 24 hours
@@ -111,8 +104,8 @@ app.post("/api/auth/logout", async (c) => {
     const sessionToken = cookieHeader?.match(/session_token=([^;]+)/)?.[1];
 
     if (sessionToken) {
-      // Delete the session from KV
-      await c.env.USER_SESSIONS.delete(`session:${sessionToken}`);
+      // Delete the session from database
+      await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(sessionToken).run();
     }
 
     // Clear the session cookie
@@ -136,31 +129,25 @@ app.get("/api/auth/me", async (c) => {
       return c.json({ error: "Not authenticated" }, 401);
     }
 
-    // Get user ID from session
-    const userId = await c.env.USER_SESSIONS.get(`session:${sessionToken}`);
+    // Verify session in database
+    const session = await c.env.DB.prepare(
+      'SELECT user_id FROM sessions WHERE id = ? AND expires_at > ?'
+    ).bind(sessionToken, new Date().toISOString()).first();
 
-    if (!userId) {
+    if (!session) {
       return c.json({ error: "Session not found or expired" }, 401);
     }
 
-    // Get user email by ID
-    const userEmail = await c.env.USER_SESSIONS.get(`user_id:${userId}`);
-    if (!userEmail) {
+    // Get user details from database
+    const user = await c.env.DB.prepare(
+      'SELECT id, email, firstName, lastName, createdAt FROM users WHERE id = ?'
+    ).bind(session.user_id).first();
+
+    if (!user) {
       return c.json({ error: "User not found" }, 401);
     }
 
-    // Get full user details
-    const userStr = await c.env.USER_SESSIONS.get(`user:${userEmail}`);
-    if (!userStr) {
-      return c.json({ error: "User not found" }, 401);
-    }
-
-    const user = JSON.parse(userStr);
-
-    // Return user info without password
-    const { password: _, ...userWithoutPassword } = user;
-
-    return c.json({ user: userWithoutPassword });
+    return c.json({ user: user });
   } catch (error) {
     console.error("Get user error:", error);
     return c.json({ error: "Failed to get user info" }, 500);
@@ -249,10 +236,12 @@ app.post("/api/food/order", async (c) => {
       return c.json({ error: "Not authenticated" }, 401);
     }
 
-    // Get user ID from session
-    const userId = await c.env.USER_SESSIONS.get(`session:${sessionToken}`);
+    // Verify session in database
+    const session = await c.env.DB.prepare(
+      'SELECT user_id FROM sessions WHERE id = ? AND expires_at > ?'
+    ).bind(sessionToken, new Date().toISOString()).first();
 
-    if (!userId) {
+    if (!session) {
       return c.json({ error: "Session not found or expired" }, 401);
     }
 
@@ -267,7 +256,7 @@ app.post("/api/food/order", async (c) => {
     }
 
     // Generate order ID
-    const orderId = `order_${Date.now()}_${userId}`;
+    const orderId = `order_${Date.now()}_${session.user_id}`;
 
     // Calculate total
     const calculatedTotal = items.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
@@ -277,32 +266,22 @@ app.post("/api/food/order", async (c) => {
       return c.json({ error: "Invalid total amount" }, 400);
     }
 
-    // Create order object
-    const order = {
-      id: orderId,
-      userId,
-      items,
+    // Store order in database (items as JSON string)
+    await c.env.DB.prepare(
+      'INSERT INTO orders (id, user_id, items, total_amount, delivery_address, payment_method, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      orderId,
+      session.user_id,
+      JSON.stringify(items),
       totalAmount,
       deliveryAddress,
       paymentMethod,
-      status: 'pending',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    // Store order in KV
-    await c.env.USER_SESSIONS.put(`order:${orderId}`, JSON.stringify(order));
-
-    // Store user's order history
-    const userOrdersKey = `user_orders:${userId}`;
-    let userOrdersStr = await c.env.USER_SESSIONS.get(userOrdersKey);
-    let userOrders: string[] = userOrdersStr ? JSON.parse(userOrdersStr) : [];
-    userOrders.push(orderId);
-    await c.env.USER_SESSIONS.put(userOrdersKey, JSON.stringify(userOrders));
+      'pending'
+    ).run();
 
     return c.json({
       message: "Order placed successfully",
-      order: { id: orderId, status: order.status }
+      order: { id: orderId, status: 'pending' }
     });
   } catch (error) {
     console.error("Place order error:", error);
@@ -321,28 +300,27 @@ app.get("/api/food/orders", async (c) => {
       return c.json({ error: "Not authenticated" }, 401);
     }
 
-    // Get user ID from session
-    const userId = await c.env.USER_SESSIONS.get(`session:${sessionToken}`);
+    // Verify session in database
+    const session = await c.env.DB.prepare(
+      'SELECT user_id FROM sessions WHERE id = ? AND expires_at > ?'
+    ).bind(sessionToken, new Date().toISOString()).first();
 
-    if (!userId) {
+    if (!session) {
       return c.json({ error: "Session not found or expired" }, 401);
     }
 
-    // Get user's order history
-    const userOrdersKey = `user_orders:${userId}`;
-    const userOrdersStr = await c.env.USER_SESSIONS.get(userOrdersKey);
-    const orderIds = userOrdersStr ? JSON.parse(userOrdersStr) : [];
+    // Get user's order history from database
+    const orders = await c.env.DB.prepare(
+      'SELECT id, items, total_amount as totalAmount, delivery_address as deliveryAddress, payment_method as paymentMethod, status, created_at as createdAt FROM orders WHERE user_id = ? ORDER BY created_at DESC'
+    ).bind(session.user_id).all();
 
-    // Fetch each order
-    const orders = [];
-    for (const orderId of orderIds) {
-      const orderStr = await c.env.USER_SESSIONS.get(`order:${orderId}`);
-      if (orderStr) {
-        orders.push(JSON.parse(orderStr));
-      }
-    }
+    // Parse items from JSON strings for each order
+    const parsedOrders = orders.results.map((order: any) => ({
+      ...order,
+      items: JSON.parse(order.items)
+    }));
 
-    return c.json({ orders });
+    return c.json({ orders: parsedOrders });
   } catch (error) {
     console.error("Get orders error:", error);
     return c.json({ error: "Failed to get orders" }, 500);
